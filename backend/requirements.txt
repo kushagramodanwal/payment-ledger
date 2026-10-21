@@ -9,3 +9,4 @@ bcrypt==4.1.2
 python-jose
 pydantic
 email-validator
+psycopg[binary]
