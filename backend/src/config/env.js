@@ -1,4 +1,3 @@
-// config.py ka equivalent: env variables load + validate
 require("dotenv").config();
 
 const required = ["MONGO_URI", "JWT_SECRET"];

@@ -1,4 +1,3 @@
-// database.py ka equivalent
 const mongoose = require("mongoose");
 const { MONGO_URI } = require("./env");
 
