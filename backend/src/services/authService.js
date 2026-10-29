@@ -1,11 +1,8 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const mongoose = require("mongoose");
 
-const User = require("../models/User");
-const Wallet = require("../models/Wallet");
+const { pool, withTransaction } = require("../config/db");
 const AppError = require("../utils/AppError");
-const { nextId } = require("../utils/ids");
 const { toPaise } = require("../utils/money");
 const { JWT_SECRET, JWT_EXPIRE_MINUTES, INITIAL_BALANCE_INR } = require("../config/env");
 
@@ -22,46 +19,47 @@ function validateSignup({ name, email, password }) {
     throw new AppError(400, "Password cannot exceed 72 bytes (bcrypt limitation)");
 }
 
-// User + Wallet ek saath banao (atomic): ek fail to dono cancel
+// Create the user and wallet in one PostgreSQL transaction.
 async function signup({ name, email, password }) {
   validateSignup({ name, email, password });
   name = name.trim();
   email = email.toLowerCase().trim();
 
-  if (await User.findOne({ email })) throw new AppError(400, "User already exists");
-
   const passwordHash = await bcrypt.hash(password, 10);
-  const userId = await nextId("users");
-  const walletId = await nextId("wallets");
-
-  const session = await mongoose.startSession();
   try {
-    await session.withTransaction(async () => {
-      await User.create([{ _id: userId, name, email, passwordHash }], { session });
-      await Wallet.create(
-        [{
-          _id: walletId,
-          userId,
-          name: `${name}'s Wallet`,
-          balancePaise: toPaise(INITIAL_BALANCE_INR),
-        }],
-        { session }
+    await withTransaction(async (client) => {
+      const userResult = await client.query(
+        `INSERT INTO users (name, email, password_hash)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [name, email, passwordHash]
+      );
+      const userId = userResult.rows[0].id;
+      await client.query(
+        `INSERT INTO wallets (user_id, name, balance_paise)
+         VALUES ($1, $2, $3)`,
+        [userId, `${name}'s Wallet`, toPaise(INITIAL_BALANCE_INR)]
       );
     });
-  } catch (e) {
-    if (e.code === 11000) throw new AppError(400, "User already exists"); // do signup ek saath
-    throw e;
-  } finally {
-    await session.endSession();
+  } catch (error) {
+    if (error.code === "23505" && error.constraint === "users_email_key")
+      throw new AppError(400, "User already exists");
+    throw error;
   }
 }
 
 async function login({ email, password }) {
-  const user = typeof email === "string" ? await User.findOne({ email: email.toLowerCase().trim() }) : null;
-  const ok = user && typeof password === "string" && (await bcrypt.compare(password, user.passwordHash));
+  const result = typeof email === "string"
+    ? await pool.query(
+        "SELECT id, password_hash FROM users WHERE email = $1",
+        [email.toLowerCase().trim()]
+      )
+    : { rows: [] };
+  const user = result.rows[0];
+  const ok = user && typeof password === "string" && (await bcrypt.compare(password, user.password_hash));
   if (!ok) throw new AppError(401, "Invalid credentials");
 
-  return jwt.sign({ sub: String(user._id) }, JWT_SECRET, {
+  return jwt.sign({ sub: String(user.id) }, JWT_SECRET, {
     algorithm: "HS256",
     expiresIn: `${JWT_EXPIRE_MINUTES}m`,
   });

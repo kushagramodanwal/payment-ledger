@@ -14,7 +14,7 @@ const app = express();
 app.use(express.json());
 
 app.get("/health", (req, res) =>
-  res.json({ status: "healthy", version: "3.0.0", currency: "INR" })
+  res.json({ status: "healthy", version: "4.0.0", currency: "INR" })
 );
 
 app.use("/auth", require("./routes/auth"));

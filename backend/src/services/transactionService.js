@@ -1,33 +1,39 @@
-const mongoose = require("mongoose");
-
-const Wallet = require("../models/Wallet");
-const Transaction = require("../models/Transaction");
+const { pool, withTransaction } = require("../config/db");
 const AppError = require("../utils/AppError");
-const { nextId } = require("../utils/ids");
 const { toPaise, toRupees } = require("../utils/money");
 const { encodeCursor, decodeCursor } = require("../utils/pagination");
 
-const MAX_AMOUNT_INR = 1000000; // 10 lakh
+const MAX_AMOUNT_INR = 1000000; // ₹10 lakh
 
 const result = (tx) => ({
-  transaction_id: tx._id,
+  transaction_id: tx.id,
   status: tx.status,
-  amount: toRupees(tx.amountPaise),
+  amount: toRupees(tx.amount_paise),
 });
 
-/**
- * Transfer flow (Python wale steps ka Mongo version):
- * 1. Validate
- * 2. Idempotency check (same key => purana result)
- * 3. Mongo transaction shuru
- * 4. Sender wallet se paise kaato: filter me "balance >= amount" => check + minus ek hi atomic step.
- *    (Python mein ye kaam SELECT ... FOR UPDATE row lock karta tha)
- * 5. Receiver ko paise jodo
- * 6. Transaction record likho
- * 7. Commit (error aaya to sab rollback)
- */
+function replayExisting(tx, senderWalletId, receiverWalletId, amountPaise) {
+  if (
+    Number(tx.sender_wallet_id) !== Number(senderWalletId) ||
+    Number(tx.receiver_wallet_id) !== Number(receiverWalletId) ||
+    Number(tx.amount_paise) !== Number(amountPaise)
+  ) {
+    throw new AppError(409, "IDEMPOTENCY_KEY_CONFLICT");
+  }
+  if (tx.status === "FAILED") throw new AppError(400, "INSUFFICIENT_BALANCE");
+  return result(tx);
+}
+
+async function findTransactionByKey(idempotencyKey) {
+  const found = await pool.query(
+    `SELECT id, idempotency_key, sender_wallet_id, receiver_wallet_id,
+            amount_paise, status, created_at
+     FROM transactions WHERE idempotency_key = $1`,
+    [idempotencyKey]
+  );
+  return found.rows[0] || null;
+}
+
 async function transferMoney({ senderUserId, receiverUserId, amount, idempotencyKey }) {
-  // ---- 1. validate ----
   if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0)
     throw new AppError(400, "Amount must be positive");
   if (amount > MAX_AMOUNT_INR) throw new AppError(400, "Amount cannot exceed ₹10,00,000");
@@ -37,94 +43,72 @@ async function transferMoney({ senderUserId, receiverUserId, amount, idempotency
   const amountPaise = toPaise(amount);
   if (amountPaise <= 0) throw new AppError(400, "Amount must be positive");
 
-  const [senderWallet, receiverWallet] = await Promise.all([
-    Wallet.findOne({ userId: senderUserId }),
-    Wallet.findOne({ userId: receiverUserId }),
-  ]);
+  const walletsResult = await pool.query(
+    `SELECT id, user_id, balance_paise
+     FROM wallets WHERE user_id = ANY($1::integer[])`,
+    [[senderUserId, receiverUserId]]
+  );
+  const senderWallet = walletsResult.rows.find((w) => Number(w.user_id) === senderUserId);
+  const receiverWallet = walletsResult.rows.find((w) => Number(w.user_id) === receiverUserId);
   if (!senderWallet) throw new AppError(400, "Sender wallet not found");
   if (!receiverWallet) throw new AppError(400, "Receiver wallet not found");
 
-  // ---- 2. idempotency ----
-  const existing = await Transaction.findOne({ idempotencyKey });
-  if (existing) return replayExisting(existing, senderWallet._id, receiverWallet._id, amountPaise);
+  const existing = await findTransactionByKey(idempotencyKey);
+  if (existing) return replayExisting(existing, senderWallet.id, receiverWallet.id, amountPaise);
 
-  const txId = await nextId("transactions"); // transaction ke bahar (counter par lock na bane)
-
-  // ---- 3-7. atomic transfer ----
-  const session = await mongoose.startSession();
+  let insufficientBalance = false;
   try {
-    let created;
-    await session.withTransaction(async () => {
-      const debited = await Wallet.findOneAndUpdate(
-        { _id: senderWallet._id, balancePaise: { $gte: amountPaise } },
-        { $inc: { balancePaise: -amountPaise } },
-        { session, new: true }
+    const created = await withTransaction(async (client) => {
+      // Lock both wallets in deterministic ID order to reduce deadlock risk.
+      const lockedResult = await client.query(
+        `SELECT id, user_id, balance_paise FROM wallets
+         WHERE id = ANY($1::integer[]) ORDER BY id FOR UPDATE`,
+        [[senderWallet.id, receiverWallet.id]]
       );
-      if (!debited) throw new AppError(400, "INSUFFICIENT_BALANCE");
+      const lockedSender = lockedResult.rows.find((w) => Number(w.id) === Number(senderWallet.id));
+      const lockedReceiver = lockedResult.rows.find((w) => Number(w.id) === Number(receiverWallet.id));
+      if (!lockedSender || !lockedReceiver) throw new AppError(400, "Wallet not found");
 
-      await Wallet.updateOne(
-        { _id: receiverWallet._id },
-        { $inc: { balancePaise: amountPaise } },
-        { session }
-      );
+      if (Number(lockedSender.balance_paise) < amountPaise) {
+        const failed = await client.query(
+          `INSERT INTO transactions
+             (idempotency_key, sender_wallet_id, receiver_wallet_id, amount_paise, status)
+           VALUES ($1, $2, $3, $4, 'FAILED')
+           RETURNING id, status, amount_paise`,
+          [idempotencyKey, senderWallet.id, receiverWallet.id, amountPaise]
+        );
+        insufficientBalance = true;
+        return failed.rows[0];
+      }
 
-      [created] = await Transaction.create(
-        [{
-          _id: txId,
-          idempotencyKey,
-          senderWalletId: senderWallet._id,
-          receiverWalletId: receiverWallet._id,
-          amountPaise,
-          status: "SUCCESS",
-        }],
-        { session }
+      await client.query(
+        "UPDATE wallets SET balance_paise = balance_paise - $1, updated_at = NOW() WHERE id = $2",
+        [amountPaise, senderWallet.id]
       );
+      await client.query(
+        "UPDATE wallets SET balance_paise = balance_paise + $1, updated_at = NOW() WHERE id = $2",
+        [amountPaise, receiverWallet.id]
+      );
+      const inserted = await client.query(
+        `INSERT INTO transactions
+           (idempotency_key, sender_wallet_id, receiver_wallet_id, amount_paise, status)
+         VALUES ($1, $2, $3, $4, 'SUCCESS')
+         RETURNING id, status, amount_paise`,
+        [idempotencyKey, senderWallet.id, receiverWallet.id, amountPaise]
+      );
+      return inserted.rows[0];
     });
+
+    if (insufficientBalance) throw new AppError(400, "INSUFFICIENT_BALANCE");
     return result(created);
-  } catch (e) {
-    // Insufficient balance: audit trail ke liye FAILED record (Python jaisa), phir 400
-    if (e instanceof AppError && e.detail === "INSUFFICIENT_BALANCE") {
-      await recordFailed({ txId, idempotencyKey, senderWallet, receiverWallet, amountPaise });
-      throw e;
-    }
-    // Race: do same-key requests ek saath aayi. Jo jeet gayi uska result do.
-    if (e.code === 11000) {
-      const winner = await Transaction.findOne({ idempotencyKey });
-      if (winner) return replayExisting(winner, senderWallet._id, receiverWallet._id, amountPaise);
+  } catch (error) {
+    // A concurrent request may have committed the same idempotency key.
+    if (error.code === "23505" && error.constraint === "transactions_idempotency_key_key") {
+      const winner = await findTransactionByKey(idempotencyKey);
+      if (winner) return replayExisting(winner, senderWallet.id, receiverWallet.id, amountPaise);
       throw new AppError(409, "IDEMPOTENCY_KEY_CONFLICT");
     }
-    throw e;
-  } finally {
-    await session.endSession();
-  }
-}
-
-function replayExisting(tx, senderWalletId, receiverWalletId, amountPaise) {
-  // Same key + alag payload => conflict
-  if (
-    tx.senderWalletId !== senderWalletId ||
-    tx.receiverWalletId !== receiverWalletId ||
-    tx.amountPaise !== amountPaise
-  ) {
-    throw new AppError(409, "IDEMPOTENCY_KEY_CONFLICT");
-  }
-  // Pehle FAILED tha to dobara wahi error
-  if (tx.status === "FAILED") throw new AppError(400, "INSUFFICIENT_BALANCE");
-  return result(tx);
-}
-
-async function recordFailed({ txId, idempotencyKey, senderWallet, receiverWallet, amountPaise }) {
-  try {
-    await Transaction.create({
-      _id: txId,
-      idempotencyKey,
-      senderWalletId: senderWallet._id,
-      receiverWalletId: receiverWallet._id,
-      amountPaise,
-      status: "FAILED",
-    });
-  } catch (e) {
-    if (e.code !== 11000) throw e; // duplicate key ho to koi baat nahi
+    throw error;
   }
 }
 
@@ -132,26 +116,37 @@ async function getTransactionHistory({ userId, limit, cursor }) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100)
     throw new AppError(400, "Limit must be between 1 and 100");
 
-  const wallet = await Wallet.findOne({ userId });
+  const walletResult = await pool.query("SELECT id FROM wallets WHERE user_id = $1", [userId]);
+  const wallet = walletResult.rows[0];
   if (!wallet) throw new AppError(400, "Wallet not found");
 
-  const filter = { $or: [{ senderWalletId: wallet._id }, { receiverWalletId: wallet._id }] };
-  if (cursor) filter._id = { $lt: decodeCursor(cursor) };
-
-  // limit + 1 => ek extra laao taaki pata chale agla page hai ya nahi
-  const rows = await Transaction.find(filter).sort({ _id: -1 }).limit(limit + 1).lean();
+  const values = [wallet.id];
+  let cursorClause = "";
+  if (cursor) {
+    values.push(decodeCursor(cursor));
+    cursorClause = `AND id < $${values.length}`;
+  }
+  values.push(limit + 1);
+  const rowsResult = await pool.query(
+    `SELECT id, sender_wallet_id, receiver_wallet_id, amount_paise, status, created_at
+     FROM transactions
+     WHERE (sender_wallet_id = $1 OR receiver_wallet_id = $1) ${cursorClause}
+     ORDER BY id DESC LIMIT $${values.length}`,
+    values
+  );
+  const rows = rowsResult.rows;
   const hasNext = rows.length > limit;
   const page = hasNext ? rows.slice(0, limit) : rows;
 
   return {
     data: page.map((tx) => ({
-      id: tx._id,
-      amount: toRupees(tx.amountPaise),
-      type: tx.senderWalletId === wallet._id ? "DEBIT" : "CREDIT",
+      id: tx.id,
+      amount: toRupees(tx.amount_paise),
+      type: Number(tx.sender_wallet_id) === Number(wallet.id) ? "DEBIT" : "CREDIT",
       status: tx.status,
-      created_at: tx.createdAt,
+      created_at: tx.created_at,
     })),
-    next_cursor: hasNext ? encodeCursor(page[page.length - 1]._id) : null,
+    next_cursor: hasNext ? encodeCursor(page[page.length - 1].id) : null,
   };
 }
 
